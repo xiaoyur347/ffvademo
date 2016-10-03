@@ -1404,6 +1404,145 @@ renderer_redraw(FFVARendererEGL *rnd, FFVASurface *s,
     return true;
 }
 
+/* change from here */
+
+static GLuint s_vaCaptureTexture = 0;
+static VASurfaceID s_vaCaptureSurface = VA_INVALID_ID;
+static VASurfaceID s_vaFilterSurface = VA_INVALID_ID;
+static FFVAFilter *s_vaFilter = NULL;
+
+static int ensure_filter_surface(FFVARendererEGL *rnd)
+{
+    s_vaFilter = ffva_filter_new(rnd->base.display);
+    VAStatus va_status;
+    // Create surface
+#if 0 //fail
+    va_status = vaCreateSurfaces(
+        rnd->va_display,
+        VA_RT_FORMAT_YUV420,
+        rnd->native_renderer->width, rnd->native_renderer->height,
+        &s_vaFilterSurface, 1,
+        NULL, 0
+    );
+#else //success
+    VASurfaceAttrib va_attrib;
+    va_attrib.type = VASurfaceAttribPixelFormat;
+    va_attrib.flags = VA_SURFACE_ATTRIB_SETTABLE;
+    va_attrib.value.type = VAGenericValueTypeInteger;
+    va_attrib.value.value.i = VA_FOURCC_NV12;
+    va_status = vaCreateSurfaces(
+        rnd->va_display,
+        VA_RT_FORMAT_YUV420,
+        rnd->native_renderer->width, rnd->native_renderer->height,
+        &s_vaFilterSurface, 1,
+        &va_attrib, 1
+    );
+#endif
+}
+
+static int ensure_capture_texture(FFVARendererEGL *rnd)
+{
+    EglContext * const egl = &rnd->egl_context;
+
+    if (s_vaCaptureSurface != VA_INVALID_ID)
+    {
+        return 0;
+    }
+    ensure_filter_surface(rnd);
+
+    glGenTextures(1, &s_vaCaptureTexture);
+    av_log(NULL, AV_LOG_INFO, "glGenTextures %d\n", s_vaCaptureTexture);
+    glBindTexture(GL_TEXTURE_2D, s_vaCaptureTexture);
+    gl_texture_init_defaults(s_vaCaptureTexture, GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+        rnd->native_renderer->width, rnd->native_renderer->height,
+        0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    GLint attribs[23], *attrib;
+    attrib = attribs;
+    *attrib++ = EGL_IMAGE_PRESERVED_KHR;
+    *attrib++ = EGL_TRUE;
+    *attrib++ = EGL_NONE;
+    PFNEGLCREATEIMAGEKHRPROC egl_create_image_khr
+        = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    EGLImageKHR image = egl_create_image_khr(egl->display,
+        egl->context,
+        EGL_GL_TEXTURE_2D_KHR, (EGLClientBuffer)(uintptr_t)s_vaCaptureTexture,
+        attribs);
+    if (!image)
+    {
+        av_log(NULL, AV_LOG_ERROR, "func = %p\n", egl_create_image_khr);
+        return -1;
+    }
+
+    EGLint name, stride;
+    PFNEGLEXPORTDRMIMAGEMESAPROC egl_export_drm_image_mesa =
+        (PFNEGLEXPORTDRMIMAGEMESAPROC)eglGetProcAddress("eglExportDRMImageMESA");
+    if (!egl_export_drm_image_mesa(egl->display, image, &name,
+        NULL, &stride))
+    {
+        av_log(NULL, AV_LOG_ERROR, "egl_export_drm_image_mesa\n");
+        return -1;
+    }
+
+    VASurfaceAttrib va_attribs[2], *va_attrib;
+    VASurfaceAttribExternalBuffers va_extbuf;
+    va_attrib = va_attribs;
+    va_attrib->type = VASurfaceAttribExternalBufferDescriptor;
+    va_attrib->flags = VA_SURFACE_ATTRIB_SETTABLE;
+    va_attrib->value.type = VAGenericValueTypePointer;
+    va_attrib->value.value.p = &va_extbuf;
+    va_attrib++;
+    va_attrib->type = VASurfaceAttribMemoryType;
+    va_attrib->flags = VA_SURFACE_ATTRIB_SETTABLE;
+    va_attrib->value.type = VAGenericValueTypeInteger;
+    va_attrib->value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_KERNEL_DRM;
+    va_attrib++;
+
+    unsigned long va_extbuf_handle;
+    va_extbuf_handle = name;
+    va_extbuf.pixel_format = VA_FOURCC('R','G','B','A');
+    va_extbuf.width = rnd->native_renderer->width;
+    va_extbuf.height = rnd->native_renderer->height;
+    va_extbuf.data_size = va_extbuf.height * stride;
+    va_extbuf.num_planes = 1;
+    va_extbuf.pitches[0] = stride;
+    va_extbuf.offsets[0] = 0;
+    va_extbuf.buffers = &va_extbuf_handle;
+    va_extbuf.num_buffers = 1;
+    va_extbuf.flags = 0;
+    va_extbuf.private_data = NULL;
+    vaCreateSurfaces(rnd->va_display, VA_RT_FORMAT_RGB32,
+        rnd->native_renderer->width, rnd->native_renderer->height,
+        &s_vaCaptureSurface, 1, va_attribs,
+        va_attrib - va_attribs);
+}
+
+static void capture_display(FFVARendererEGL *rnd)
+{
+    ensure_capture_texture(rnd);
+    glBindTexture(GL_TEXTURE_2D, s_vaCaptureTexture);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0,
+    	rnd->native_renderer->width, rnd->native_renderer->height, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    FFVASurface src_surface;
+    src_surface.id = s_vaCaptureSurface;
+    src_surface.width = rnd->native_renderer->width;
+    src_surface.height = rnd->native_renderer->height;
+
+    FFVASurface dst_surface;
+    dst_surface.id = s_vaFilterSurface;
+    dst_surface.width = rnd->native_renderer->width;
+    dst_surface.height = rnd->native_renderer->height;
+    int ret = ffva_filter_process(s_vaFilter, &src_surface, &dst_surface, 0);
+    if (ret != 0)
+    {
+    	av_log(NULL, AV_LOG_ERROR, "ret=%d\n", ret);
+    }
+}
+
 static bool
 renderer_put_surface(FFVARendererEGL *rnd, FFVASurface *surface,
     const VARectangle *src_rect, const VARectangle *dst_rect, uint32_t flags)
@@ -1436,6 +1575,8 @@ renderer_put_surface(FFVARendererEGL *rnd, FFVASurface *surface,
             surface->id);
         has_errors++;
     }
+
+    capture_display(rnd);
     return !has_errors;
 }
 
